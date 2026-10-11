@@ -17,5 +17,5 @@ func run() -> void:
 		push_error("Smoke checks failed: %s" % [errors])
 		quit(1)
 		return
-	print("PASS: 3 stages, 8 upgrades, auto-drop, enemy spawning, and state transitions")
+	print("PASS: 3D drag flight, triple auto-drop, evolutions, anger, banking, and lineage")
 	quit(0)
