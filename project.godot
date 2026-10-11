@@ -1,0 +1,25 @@
+; Engine configuration file.
+; Edit with Godot 4.5 or newer.
+config_version=5
+
+[application]
+config/name="ハト爆撃隊"
+run/main_scene="res://src/Main.tscn"
+config/features=PackedStringArray("4.5", "GL Compatibility")
+
+[display]
+window/size/viewport_width=540
+window/size/viewport_height=960
+window/size/window_width_override=540
+window/size/window_height_override=960
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/handheld/orientation=1
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/default_filters/use_nearest_mipmap_filter=false
+environment/defaults/default_clear_color=Color(0.82, 0.93, 0.96, 1)
+[audio]
+driver/enable_input=false
