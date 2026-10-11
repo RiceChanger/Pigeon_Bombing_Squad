@@ -1,15 +1,33 @@
 extends Node3D
 
-const WORLD_HALF := Vector2(62.0, 108.0)
+const WORLD_HALF := Vector2(72.0, 108.0)
 const PLAYER_ALTITUDE := 13.0
-const NEST_POSITION := Vector3(0.0, 0.0, 93.0)
+const NEST_POSITIONS := [
+	Vector3(-50.0,0.0,82.0),
+	Vector3(50.0,0.0,82.0),
+	Vector3(0.0,0.0,-88.0)
+]
+const TARGET_CLUSTER_CENTERS := [
+	Vector3(-23.0,0.0,-62.0), Vector3(22.0,0.0,-45.0),
+	Vector3(-26.0,0.0,-18.0), Vector3(25.0,0.0,10.0),
+	Vector3(-22.0,0.0,38.0), Vector3(21.0,0.0,63.0)
+]
+const INITIAL_TARGETS_PER_CLUSTER := 4
+const MAX_TARGETS := 36
+const TARGET_CLUSTER_RADIUS := 7.5
+const TARGET_MOVE_MIN := 1.2
+const TARGET_MOVE_MAX := 2.2
+const COMBO_GRACE_SECONDS := 3.8
+const ANGER_PER_HIT := 1.2
+const ANGER_PER_DEFEAT := 2.8
+const NEST_TRIGGER_RADIUS := 7.0
 const SAVE_PATH := "user://pigeon_bombing_3d_save.json"
 const EVOLUTION_TYPES := ["rapid", "split", "flock"]
 
 enum ScreenState { TITLE, PLAYING, RESULT }
 
 var state := ScreenState.TITLE
-var player_pos := Vector3(0.0, PLAYER_ALTITUDE, 48.0)
+var player_pos := Vector3(0.0, PLAYER_ALTITUDE, 0.0)
 var player_velocity := Vector2.ZERO
 var drag_active := false
 var drag_origin := Vector2.ZERO
@@ -23,7 +41,10 @@ var anger := 0.0
 var drop_clock := 0.0
 var spawn_clock := 0.0
 var attack_serial := 0
+var target_spawn_serial := 0
 var has_flown_out := false
+var anger_flash_clock := 0.0
+var anger_notice_clock := 0.0
 var evolution := {"rapid":0.0, "split":0.0, "flock":0.0}
 var evolved := {"rapid":false, "split":false, "flock":false}
 var showcase_kind := ""
@@ -48,11 +69,12 @@ var rapid_badge: MeshInstance3D
 var split_badge: MeshInstance3D
 var flock_left: Node3D
 var flock_right: Node3D
-var nest_ring: MeshInstance3D
+var nest_rings: Array[MeshInstance3D] = []
 var camera: Camera3D
 var ui_root: Control
 var score_label: Label
 var anger_bar: ColorRect
+var anger_notice_label: Label
 var combo_label: Label
 var nest_label: Label
 var evo_bars := {}
@@ -148,9 +170,9 @@ func animate_pigeon() -> void:
 	left_wing.rotation.z = -0.20-flap
 	right_wing.rotation.z = 0.20+flap
 	pigeon.position.y = PLAYER_ALTITUDE+sin(flight_time*3.2)*0.24
-	if is_instance_valid(nest_ring):
-		var nest_pulse := 1.0+sin(flight_time*4.0)*0.08
-		nest_ring.scale = Vector3(nest_pulse,1.0,nest_pulse)
+	var nest_pulse := 1.0+sin(flight_time*4.0)*0.08
+	for ring in nest_rings:
+		if is_instance_valid(ring):ring.scale = Vector3(nest_pulse,1.0,nest_pulse)
 
 func update_player_transform(delta: float) -> void:
 	pigeon.position.x = player_pos.x
@@ -162,7 +184,8 @@ func update_player_transform(delta: float) -> void:
 	pigeon_shadow.scale = Vector3(shadow_scale,1.0,shadow_scale)
 
 func update_game(delta: float) -> void:
-	anger = minf(100.0,anger+delta*0.48)
+	anger_flash_clock=maxf(0.0,anger_flash_clock-delta)
+	anger_notice_clock=maxf(0.0,anger_notice_clock-delta)
 	combo_clock = maxf(0.0,combo_clock-delta)
 	if combo_clock<=0.0:
 		combo=0
@@ -182,15 +205,15 @@ func update_game(delta: float) -> void:
 	spawn_clock -= delta
 	if spawn_clock<=0.0:
 		spawn_target()
-		spawn_clock += rng.randf_range(0.75,1.25)
+		spawn_clock += rng.randf_range(1.2,1.8)
 	update_poops(delta)
 	update_targets(delta)
 	update_effects(delta)
 	update_hud()
-	var nest_distance := distance_xz(player_pos,NEST_POSITION)
+	var nest_distance := distance_xz(player_pos,nearest_nest_position())
 	if nest_distance>11.0:
 		has_flown_out=true
-	if has_flown_out and nest_distance<6.0:
+	if has_flown_out and nest_distance<NEST_TRIGGER_RADIUS:
 		finish_sortie(true)
 	elif anger>=100.0:
 		finish_sortie(false)
@@ -204,7 +227,7 @@ func current_drop_interval() -> float:
 	return interval
 
 func current_radius() -> float:
-	var radius := 4.7
+	var radius := 5.3
 	if bool(evolved.split):
 		radius += 2.0
 	elif String(save_data.lineage)=="split":
@@ -264,10 +287,10 @@ func impact_poop(position: Vector3) -> void:
 		hit_count+=hits
 		combo+=1
 		max_combo=maxi(max_combo,combo)
-		combo_clock=2.5
+		combo_clock=COMBO_GRACE_SECONDS
 		var multiplier:=minf(3.0,1.0+floorf(float(combo-1)/3.0)*0.25)
 		score+=int(48.0*hits*multiplier)
-		anger=minf(100.0,anger+hits*1.5)
+		add_anger(float(hits)*ANGER_PER_HIT,"命中")
 		if center_hits>0:
 			gain_evolution("rapid",24.0*center_hits)
 		if hits>=2:
@@ -280,6 +303,15 @@ func impact_poop(position: Vector3) -> void:
 	splat.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	effects.append({"node":splat,"time":0.52,"max_time":0.52,"kind":"splat"})
 	play_tone(215.0 if hits==0 else 430.0,0.055)
+
+func add_anger(amount: float,reason: String) -> void:
+	if amount<=0.0:return
+	anger=minf(100.0,anger+amount)
+	anger_flash_clock=0.42
+	anger_notice_clock=1.1
+	if is_instance_valid(anger_notice_label):
+		anger_notice_label.text="怒り +%.1f（%s）"%[amount,reason]
+		anger_notice_label.modulate=Color.WHITE
 
 func gain_evolution(kind: String,amount: float) -> void:
 	if bool(evolved[kind]):
@@ -329,19 +361,43 @@ func apply_evolution_visuals() -> void:
 func distance_xz(a: Vector3,b: Vector3) -> float:
 	return Vector2(a.x,a.z).distance_to(Vector2(b.x,b.z))
 
-func spawn_target() -> void:
-	if targets.size()>=32:return
-	var serial:=targets.size()+attack_serial+hit_count
+func nearest_nest_position() -> Vector3:
+	var nearest:Vector3=NEST_POSITIONS[0]
+	var best_distance:=distance_xz(player_pos,nearest)
+	for index in range(1,NEST_POSITIONS.size()):
+		var candidate:Vector3=NEST_POSITIONS[index]
+		var candidate_distance:=distance_xz(player_pos,candidate)
+		if candidate_distance<best_distance:
+			nearest=candidate
+			best_distance=candidate_distance
+	return nearest
+
+func nest_direction_arrow(target: Vector3) -> String:
+	var offset:=Vector2(target.x-player_pos.x,target.z-player_pos.z)
+	if absf(offset.x)>absf(offset.y)*1.5:return "→" if offset.x>0.0 else "←"
+	if absf(offset.y)>absf(offset.x)*1.5:return "↓" if offset.y>0.0 else "↑"
+	if offset.y>0.0:return "↘" if offset.x>0.0 else "↙"
+	return "↗" if offset.x>0.0 else "↖"
+
+func spawn_target(cluster_index: int=-1) -> void:
+	if targets.size()>=MAX_TARGETS:return
+	if cluster_index<0 or cluster_index>=TARGET_CLUSTER_CENTERS.size():
+		cluster_index=rng.randi_range(0,TARGET_CLUSTER_CENTERS.size()-1)
+	var home:Vector3=TARGET_CLUSTER_CENTERS[cluster_index]
+	var angle:=rng.randf_range(0.0,TAU)
+	var distance:=rng.randf_range(1.2,TARGET_CLUSTER_RADIUS)
+	var position:=home+Vector3(cos(angle)*distance,0.0,sin(angle)*distance)
+	var serial:=target_spawn_serial
+	target_spawn_serial+=1
 	var type:="special" if serial%9==0 else ("bike" if serial%5==0 else "human")
-	var position:=Vector3(rng.randf_range(-27.0,27.0),0.0,rng.randf_range(-WORLD_HALF.y+5.0,WORLD_HALF.y-5.0))
 	var max_dirt:=104.0 if type=="special" else (82.0 if type=="bike" else 58.0)
 	var radius:=1.55 if type!="human" else 1.1
 	var node:=build_ground_character(type,serial)
 	actor_root.add_child(node)
 	node.position=position
 	var bar:MeshInstance3D=node.get_node("DirtMeter/Fill")
-	var velocity:=Vector2.from_angle(rng.randf_range(0,TAU))*rng.randf_range(2.2,4.2)
-	targets.append({"pos":position,"vel":velocity,"dirt":0.0,"max_dirt":max_dirt,"type":type,"radius":radius,"turn":rng.randf_range(0.8,2.4),"node":node,"bar":bar})
+	var velocity:=Vector2.from_angle(rng.randf_range(0,TAU))*rng.randf_range(TARGET_MOVE_MIN,TARGET_MOVE_MAX)
+	targets.append({"pos":position,"home":home,"vel":velocity,"dirt":0.0,"max_dirt":max_dirt,"type":type,"radius":radius,"turn":rng.randf_range(0.8,2.4),"node":node,"bar":bar})
 
 func update_targets(delta: float) -> void:
 	for index in range(targets.size()-1,-1,-1):
@@ -349,11 +405,13 @@ func update_targets(delta: float) -> void:
 		target.turn-=delta
 		if target.turn<=0.0:
 			target.turn=rng.randf_range(1.0,3.0)
-			target.vel=target.vel.rotated(rng.randf_range(-1.0,1.0))
-		target.pos.x=clampf(target.pos.x+target.vel.x*delta,-WORLD_HALF.x+2.0,WORLD_HALF.x-2.0)
-		target.pos.z=clampf(target.pos.z+target.vel.y*delta,-WORLD_HALF.y+2.0,WORLD_HALF.y-2.0)
-		if absf(target.pos.x)>WORLD_HALF.x-2.5:target.vel.x*=-1.0
-		if absf(target.pos.z)>WORLD_HALF.y-2.5:target.vel.y*=-1.0
+			target.vel=target.vel.rotated(rng.randf_range(-0.85,0.85))
+		var offset:=Vector2(float(target.pos.x-target.home.x),float(target.pos.z-target.home.z))
+		if offset.length()>TARGET_CLUSTER_RADIUS:
+			var homeward:=-offset.normalized()*rng.randf_range(TARGET_MOVE_MIN,TARGET_MOVE_MAX)
+			target.vel=target.vel.lerp(homeward,0.72)
+		target.pos.x=clampf(target.pos.x+target.vel.x*delta,-42.0,42.0)
+		target.pos.z=clampf(target.pos.z+target.vel.y*delta,-98.0,92.0)
 		target.node.position=target.pos
 		if target.vel.length()>0.1:target.node.rotation.y=atan2(target.vel.x,target.vel.y)
 		var ratio:=clampf(float(target.dirt)/float(target.max_dirt),0.0,1.0)
@@ -362,7 +420,7 @@ func update_targets(delta: float) -> void:
 		if float(target.dirt)>=float(target.max_dirt):
 			var bonus:=420 if target.type=="special" else (190 if target.type=="bike" else 120)
 			score+=bonus
-			anger=minf(100.0,anger+3.5)
+			add_anger(ANGER_PER_DEFEAT,"退場")
 			var puff:=make_sphere(effect_root,1.4,Color(1,1,1,0.72),target.pos+Vector3(0,1.2,0),8,4)
 			effects.append({"node":puff,"time":0.5,"max_time":0.5,"kind":"puff"})
 			target.node.queue_free()
@@ -423,23 +481,33 @@ func clear_dynamic_nodes() -> void:
 	effects.clear()
 
 func build_city() -> void:
-	make_box(world_root,Vector3(140,0.5,230),Color("#b6c58f"),Vector3(0,-0.25,0))
-	make_box(world_root,Vector3(23,0.12,230),Color("#6d777d"),Vector3(0,0.02,0))
-	make_box(world_root,Vector3(5,0.18,230),Color("#d9d5c5"),Vector3(-14,0.04,0))
-	make_box(world_root,Vector3(5,0.18,230),Color("#d9d5c5"),Vector3(14,0.04,0))
-	for z in range(-102,106,15):make_box(world_root,Vector3(0.45,0.05,6.0),Color(1,1,1,0.78),Vector3(0,0.10,float(z)))
-	for z in range(-96,97,24):build_shop_row(float(z))
-	for z in range(-90,91,30):
-		build_tree(Vector3(-24,0,float(z)+7))
-		build_tree(Vector3(25,0,float(z)-6))
-	build_nest()
+	make_box(world_root,Vector3(160,0.5,230),Color("#b8d57d"),Vector3(0,-0.25,0))
+	var asphalt:=Color("#6d777d")
+	make_box(world_root,Vector3(28,0.12,230),asphalt,Vector3(0,0.02,0))
+	make_box(world_root,Vector3(16,0.12,196),asphalt,Vector3(-34,0.025,-3))
+	make_box(world_root,Vector3(16,0.12,196),asphalt,Vector3(34,0.025,-3))
+	for z in [-64.0,-22.0,24.0,68.0]:
+		make_box(world_root,Vector3(144,0.13,18),asphalt,Vector3(0,0.03,z))
+	for center in TARGET_CLUSTER_CENTERS:
+		make_cylinder(world_root,10.5,0.16,Color("#d9d4bd"),center+Vector3(0,0.10,0),28)
+	for z in range(-102,106,15):make_box(world_root,Vector3(0.45,0.05,6.0),Color(1,1,1,0.72),Vector3(0,0.10,float(z)))
+	for x in [-34.0,34.0]:
+		for z in range(-92,92,18):make_box(world_root,Vector3(0.40,0.05,6.0),Color(1,1,1,0.55),Vector3(x,0.10,float(z)))
+	for z in [-86.0,-56.0,-26.0,6.0,38.0,70.0]:build_shop_row(z)
+	for z in range(-84,85,28):
+		var left_tree:=Vector3(-49,0,float(z)+6)
+		var right_tree:=Vector3(49,0,float(z)-6)
+		if not position_near_any_nest(left_tree,20.0):build_tree(left_tree)
+		if not position_near_any_nest(right_tree,20.0):build_tree(right_tree)
+	for index in NEST_POSITIONS.size():build_nest(NEST_POSITIONS[index],index)
 
 func build_shop_row(z: float) -> void:
 	var colors:=[Color("#e7a39a"),Color("#9bc4d7"),Color("#e6c276"),Color("#b5a7ce")]
 	for side in [-1,1]:
-		var x:=float(side)*rng.randf_range(31.0,37.0)
-		var size:=Vector3(rng.randf_range(16,22),rng.randf_range(9,18),rng.randf_range(13,18))
+		var x:=float(side)*61.0
+		var size:=Vector3(rng.randf_range(13,16),rng.randf_range(5.5,8.0),rng.randf_range(12,16))
 		var color:Color=colors[(int(absf(z)/24.0)+(1 if side>0 else 0))%colors.size()]
+		if position_near_any_nest(Vector3(x,0,z),25.0):continue
 		make_box(world_root,size,color,Vector3(x,size.y*0.5,z))
 		make_box(world_root,Vector3(size.x*0.82,0.45,size.z*0.82),color.lightened(0.18),Vector3(x,size.y+0.22,z))
 
@@ -448,14 +516,26 @@ func build_tree(position: Vector3) -> void:
 	make_sphere(world_root,2.4,Color("#4f905d"),position+Vector3(0,4.6,0),8,4)
 	make_sphere(world_root,1.8,Color("#71ad66"),position+Vector3(1.3,5.2,0.4),8,4)
 
-func build_nest() -> void:
-	make_cylinder(world_root,5.8,0.36,Color("#87623f"),NEST_POSITION+Vector3(0,0.20,0),28)
-	make_cylinder(world_root,4.6,0.42,Color("#c49b56"),NEST_POSITION+Vector3(0,0.48,0),24)
-	nest_ring=make_cylinder(world_root,6.6,0.055,Color(0.36,1.0,0.72,0.42),NEST_POSITION+Vector3(0,0.74,0),32)
-	nest_ring.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+func position_near_any_nest(position: Vector3,radius: float) -> bool:
+	for nest_position in NEST_POSITIONS:
+		if distance_xz(position,nest_position)<radius:return true
+	return false
+
+func build_nest(position: Vector3,index: int) -> void:
+	var colors:=[Color("#5affc2"),Color("#ff7fc8"),Color("#74c9ff")]
+	var color:Color=colors[index%colors.size()]
+	make_cylinder(world_root,6.0,0.36,Color("#87623f"),position+Vector3(0,0.20,0),28)
+	make_cylinder(world_root,4.8,0.42,Color("#c49b56"),position+Vector3(0,0.48,0),24)
+	var ring:=make_cylinder(world_root,7.2,0.08,Color(color,color.a*0.78),position+Vector3(0,0.80,0),32)
+	ring.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	nest_rings.append(ring)
+	var beacon:=make_cylinder(world_root,1.35,16.0,Color(color,0.20),position+Vector3(0,8.2,0),20)
+	beacon.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var icon:=make_sphere(world_root,1.25,color,position+Vector3(0,9.5,0),10,5)
+	icon.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	for angle in range(0,360,30):
 		var rad:=deg_to_rad(float(angle))
-		var twig:=make_box(world_root,Vector3(0.35,0.22,8.0),Color("#6d492e"),NEST_POSITION+Vector3(cos(rad)*2.8,0.85,sin(rad)*2.8))
+		var twig:=make_box(world_root,Vector3(0.35,0.22,8.0),Color("#6d492e"),position+Vector3(cos(rad)*2.8,0.85,sin(rad)*2.8))
 		twig.rotation.y=-rad
 
 func build_pigeon(companion: bool) -> Node3D:
@@ -565,6 +645,7 @@ func clear_ui() -> void:
 	evo_labels.clear()
 	score_label=null
 	anger_bar=null
+	anger_notice_label=null
 	combo_label=null
 	nest_label=null
 	banner_label=null
@@ -625,7 +706,7 @@ func show_title() -> void:
 	state=ScreenState.TITLE
 	clear_dynamic_nodes()
 	clear_ui()
-	player_pos=Vector3(0,PLAYER_ALTITUDE,48)
+	player_pos=Vector3(0,PLAYER_ALTITUDE,0)
 	player_velocity=Vector2.ZERO
 	update_player_transform(0.0)
 	make_panel(Rect2(24,28,492,205),Color(0.06,0.12,0.15,0.82),22)
@@ -640,7 +721,7 @@ func show_title() -> void:
 func start_sortie() -> void:
 	clear_dynamic_nodes()
 	state=ScreenState.PLAYING
-	player_pos=Vector3(0,PLAYER_ALTITUDE,48)
+	player_pos=Vector3(0,PLAYER_ALTITUDE,0)
 	player_velocity=Vector2.ZERO
 	drag_active=false
 	drag_vector=Vector2.ZERO
@@ -653,7 +734,10 @@ func start_sortie() -> void:
 	drop_clock=0.25
 	spawn_clock=0.05
 	attack_serial=0
+	target_spawn_serial=0
 	has_flown_out=false
+	anger_flash_clock=0.0
+	anger_notice_clock=0.0
 	evolution={"rapid":0.0,"split":0.0,"flock":0.0}
 	evolved={"rapid":false,"split":false,"flock":false}
 	showcase_kind=""
@@ -661,13 +745,14 @@ func start_sortie() -> void:
 	evolution_slow_clock=0.0
 	apply_evolution_visuals()
 	build_hud()
-	for i in 10:spawn_target()
+	for cluster_index in TARGET_CLUSTER_CENTERS.size():
+		for i in INITIAL_TARGETS_PER_CLUSTER:spawn_target(cluster_index)
 	update_player_transform(0.0)
 	play_tone(540.0,0.09)
 
 func build_hud() -> void:
 	clear_ui()
-	make_panel(Rect2(12,12,516,160),Color(0.04,0.09,0.11,0.82),16)
+	make_panel(Rect2(12,12,516,184),Color(0.04,0.09,0.11,0.82),16)
 	score_label=make_label("SCORE 00000",Rect2(25,20,260,34),20)
 	combo_label=make_label("COMBO 0",Rect2(350,20,150,34),17,Color("#ffd35e"),true)
 	var colors:={"rapid":Color("#70e6ff"),"split":Color("#ffcf62"),"flock":Color("#d19cff")}
@@ -688,10 +773,11 @@ func build_hud() -> void:
 	anger_bar.size=Vector2(0,8)
 	anger_bar.color=Color("#ff6a5f")
 	ui_root.add_child(anger_bar)
-	make_label("街の怒り",Rect2(365,137,145,26),13,Color("#ff8d83"),true)
-	nest_label=make_label("巣まで 45m",Rect2(55,810,430,34),18,Color("#a8ffd5"),true)
+	make_label("命中で怒り",Rect2(365,137,145,26),13,Color("#ff8d83"),true)
+	anger_notice_label=make_label("命中すると上昇・100で失敗",Rect2(25,158,480,24),12,Color("#ffc0b9"),true)
+	nest_label=make_label("最寄りの巣",Rect2(55,810,430,34),18,Color("#a8ffd5"),true)
 	make_panel(Rect2(42,850,456,62),Color(0.04,0.09,0.11,0.72),16)
-	make_label("緑の巣へ戻ると報酬と血統を確定",Rect2(58,858,424,42),15,Color.WHITE,true)
+	make_label("3色の光柱の巣へ戻ると報酬を確定",Rect2(58,858,424,42),15,Color.WHITE,true)
 	banner_label=make_label("",Rect2(30,370,480,100),44,Color.WHITE,true)
 
 func update_hud() -> void:
@@ -699,7 +785,13 @@ func update_hud() -> void:
 	score_label.text="SCORE %05d"%score
 	combo_label.text="COMBO %d"%combo
 	anger_bar.size.x=324.0*anger/100.0
-	nest_label.text="巣まで %dm　未確定パン %d"%[int(distance_xz(player_pos,NEST_POSITION)),int(score/120)]
+	anger_bar.color=Color.WHITE if anger_flash_clock>0.0 and int(anger_flash_clock*24.0)%2==0 else Color("#ff6a5f")
+	if anger_notice_clock<=0.0:
+		anger_notice_label.text="命中すると上昇・100で失敗"
+		anger_notice_label.modulate=Color(1.0,0.75,0.72,0.78)
+	else:anger_notice_label.modulate.a=clampf(anger_notice_clock*1.8,0.35,1.0)
+	var nearest:=nearest_nest_position()
+	nest_label.text="最寄りの巣 %s %dm　未確定パン %d"%[nest_direction_arrow(nearest),int(distance_xz(player_pos,nearest)),int(score/120)]
 	for kind in EVOLUTION_TYPES:
 		evo_bars[kind].size.x=324.0*float(evolution[kind])/100.0
 		if bool(evolved[kind]):evo_labels[kind].text="進化済み"
@@ -726,9 +818,25 @@ func build_result_ui() -> void:
 func lineage_display(kind: String) -> String:
 	return {"rapid":"連射の血統","split":"分裂の血統","flock":"群れの血統","":"なし"}.get(kind,"なし")
 
+func debug_combo_burst() -> void:
+	clear_dynamic_nodes()
+	var offsets:=[Vector2(-3.0,-1.5),Vector2(0.0,-2.0),Vector2(3.0,-1.5),Vector2(-1.8,2.0),Vector2(1.8,2.0)]
+	for index in offsets.size():
+		spawn_target(index%TARGET_CLUSTER_CENTERS.size())
+		var target:=targets[targets.size()-1]
+		target.pos=Vector3(player_pos.x+offsets[index].x,0.0,player_pos.z+offsets[index].y)
+		target.home=target.pos
+		target.max_dirt=999.0
+		target.node.position=target.pos
+	for i in 3:impact_poop(Vector3(player_pos.x,0.35,player_pos.z))
+
 func _input(event: InputEvent) -> void:
 	if OS.is_debug_build() and state==ScreenState.PLAYING and event is InputEventKey and event.pressed and not event.echo:
 		match event.unicode:
+			48:
+				player_pos=nearest_nest_position()+Vector3(0.0,PLAYER_ALTITUDE,0.0)
+				has_flown_out=true
+				update_player_transform(0.0)
 			49: trigger_evolution("rapid")
 			50: trigger_evolution("split")
 			51: trigger_evolution("flock")
@@ -736,6 +844,12 @@ func _input(event: InputEvent) -> void:
 			53:
 				anger=100.0
 				finish_sortie(false)
+			54: debug_combo_burst()
+			55,56,57:
+				var nest_index:=int(event.unicode)-55
+				player_pos=NEST_POSITIONS[nest_index]+Vector3(0.0,PLAYER_ALTITUDE,12.0)
+				has_flown_out=true
+				update_player_transform(0.0)
 	if state!=ScreenState.PLAYING:return
 	if event is InputEventScreenTouch:
 		if event.pressed:
@@ -793,7 +907,15 @@ func debug_run_checks() -> Array[String]:
 	var previous_save:=save_data.duplicate(true)
 	if PLAYER_ALTITUDE<=6.0:errors.append("player altitude")
 	if EVOLUTION_TYPES.size()!=3:errors.append("evolution count")
+	if NEST_POSITIONS.size()!=3:errors.append("nest count")
 	start_sortie()
+	if targets.size()!=TARGET_CLUSTER_CENTERS.size()*INITIAL_TARGETS_PER_CLUSTER:errors.append("clustered target count")
+	clear_dynamic_nodes()
+	drop_clock=99.0
+	spawn_clock=99.0
+	var passive_anger:=anger
+	update_game(0.5)
+	if not is_equal_approx(anger,passive_anger):errors.append("passive anger regression")
 	perform_auto_drop()
 	if poops.size()<3:errors.append("strong base attack")
 	spawn_target()
@@ -804,12 +926,22 @@ func debug_run_checks() -> Array[String]:
 		targets[0].pos=Vector3(player_pos.x,0,player_pos.z)
 		update_targets(0.1)
 		if player_pos!=before:errors.append("contact damage regression")
+		var anger_before_hit:=anger
+		impact_poop(Vector3(player_pos.x,0.35,player_pos.z))
+		if anger<=anger_before_hit:errors.append("hit anger feedback")
+		if anger_notice_clock<=0.0:errors.append("anger notice")
 	for kind in EVOLUTION_TYPES:
 		trigger_evolution(kind)
 		if not bool(evolved[kind]):errors.append("evolution "+kind)
 	evolution.rapid=100.0
-	finish_sortie(true)
-	if state!=ScreenState.RESULT:errors.append("bank result")
+	for nest_index in NEST_POSITIONS.size():
+		if nest_index>0:start_sortie()
+		has_flown_out=true
+		player_pos=NEST_POSITIONS[nest_index]+Vector3(0.0,PLAYER_ALTITUDE,0.0)
+		drop_clock=99.0
+		spawn_clock=99.0
+		update_game(0.01)
+		if state!=ScreenState.RESULT or not bool(last_result.success):errors.append("nest %d banking"%nest_index)
 	if String(save_data.lineage)=="":errors.append("lineage save")
 	start_sortie()
 	anger=100.0
