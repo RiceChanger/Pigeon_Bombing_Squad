@@ -21,6 +21,9 @@ const COMBO_GRACE_SECONDS := 3.8
 const ANGER_PER_HIT := 1.2
 const ANGER_PER_DEFEAT := 2.8
 const NEST_TRIGGER_RADIUS := 7.0
+const NORMAL_HIT_SCORE := 50
+const DIRECT_HIT_SCORE := 110
+const DIRECT_HIT_RADIUS := 1.45
 const SAVE_PATH := "user://pigeon_bombing_3d_save.json"
 const EVOLUTION_TYPES := ["rapid", "split", "flock"]
 
@@ -45,6 +48,7 @@ var target_spawn_serial := 0
 var has_flown_out := false
 var anger_flash_clock := 0.0
 var anger_notice_clock := 0.0
+var camera_shake_clock := 0.0
 var evolution := {"rapid":0.0, "split":0.0, "flock":0.0}
 var evolved := {"rapid":false, "split":false, "flock":false}
 var showcase_kind := ""
@@ -62,6 +66,7 @@ var world_root: Node3D
 var actor_root: Node3D
 var effect_root: Node3D
 var pigeon: Node3D
+var pigeon_visual: Node3D
 var pigeon_shadow: MeshInstance3D
 var left_wing: Node3D
 var right_wing: Node3D
@@ -128,6 +133,7 @@ func setup_scene() -> void:
 	pigeon = build_pigeon(false)
 	pigeon.scale = Vector3.ONE * 0.48
 	add_child(pigeon)
+	pigeon_visual=pigeon.get_node("Visual")
 	pigeon_shadow = make_cylinder(effect_root,1.7,0.035,Color(0.06,0.10,0.12,0.28),Vector3.ZERO,24)
 	pigeon_shadow.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	var canvas := CanvasLayer.new()
@@ -162,13 +168,23 @@ func _process(delta: float) -> void:
 
 func update_camera(delta: float) -> void:
 	var desired := player_pos + Vector3(0.0,22.0,30.0)
+	if camera_shake_clock>0.0:
+		camera_shake_clock=maxf(0.0,camera_shake_clock-delta)
+		var shake_strength:=camera_shake_clock*0.65
+		desired+=Vector3(sin(flight_time*61.0)*shake_strength,cos(flight_time*47.0)*shake_strength*0.45,0.0)
 	camera.position = camera.position.lerp(desired,1.0-exp(-5.0*delta))
 	camera.look_at(player_pos+Vector3(0.0,-13.0,-7.0),Vector3.UP)
 
 func animate_pigeon() -> void:
-	var flap := sin(flight_time*8.7)*0.36
-	left_wing.rotation.z = -0.20-flap
-	right_wing.rotation.z = 0.20+flap
+	var flap := sin(flight_time*9.2)*0.52
+	left_wing.rotation.z = -0.18-flap
+	right_wing.rotation.z = 0.18+flap
+	left_wing.rotation.x=sin(flight_time*9.2+0.7)*0.10
+	right_wing.rotation.x=sin(flight_time*9.2+0.7)*0.10
+	var strain:=0.0
+	if state==ScreenState.PLAYING and drop_clock<0.20:strain=(0.20-drop_clock)/0.20
+	if is_instance_valid(pigeon_visual):
+		pigeon_visual.scale=Vector3(1.0+strain*0.05,1.0-strain*0.08,1.0+strain*0.10)
 	pigeon.position.y = PLAYER_ALTITUDE+sin(flight_time*3.2)*0.24
 	var nest_pulse := 1.0+sin(flight_time*4.0)*0.08
 	for ring in nest_rings:
@@ -179,6 +195,7 @@ func update_player_transform(delta: float) -> void:
 	pigeon.position.z = player_pos.z
 	if player_velocity.length()>0.15:
 		pigeon.rotation.y = lerp_angle(pigeon.rotation.y,atan2(player_velocity.x,player_velocity.y),1.0-exp(-7.0*maxf(delta,0.001)))
+	pigeon.rotation.z=lerpf(pigeon.rotation.z,clampf(-player_velocity.x*0.025,-0.34,0.34),1.0-exp(-5.0*maxf(delta,0.001)))
 	pigeon_shadow.position = Vector3(player_pos.x,0.04,player_pos.z)
 	var shadow_scale := 0.72+sin(flight_time*3.2)*0.03
 	pigeon_shadow.scale = Vector3(shadow_scale,1.0,shadow_scale)
@@ -236,6 +253,7 @@ func current_radius() -> float:
 
 func perform_auto_drop() -> void:
 	attack_serial += 1
+	play_drop_whoosh()
 	var offsets := [-2.7,0.0,2.7]
 	if bool(evolved.split):
 		offsets=[-5.2,-2.6,0.0,2.6,5.2]
@@ -275,34 +293,79 @@ func update_poops(delta: float) -> void:
 func impact_poop(position: Vector3) -> void:
 	var radius:=current_radius()
 	var hits:=0
-	var center_hits:=0
+	var direct_hits:=0
+	var raw_points:=0
+	var hit_center:=Vector3.ZERO
 	for target in targets:
 		var distance:=distance_xz(target.pos,position)
 		if distance<=radius+float(target.radius):
-			target.dirt+=52.0
+			var is_direct:=distance<=DIRECT_HIT_RADIUS
+			target.dirt+=70.0 if is_direct else 46.0
+			target.reaction=1.20 if is_direct else 0.82
+			target.reaction_kind="direct" if is_direct else "normal"
+			target.dirt_node.visible=true
+			target.reaction_icon.visible=true
+			target.reaction_icon.text="!!" if is_direct else "!"
+			target.reaction_icon.modulate=Color("#ff785e") if is_direct else Color("#ffca4a")
+			spawn_hit_splash(target.pos,is_direct)
 			hits+=1
-			if distance<=1.45:
-				center_hits+=1
+			hit_center+=target.pos
+			if is_direct:
+				direct_hits+=1
+				raw_points+=DIRECT_HIT_SCORE
+			else:raw_points+=NORMAL_HIT_SCORE
 	if hits>0:
 		hit_count+=hits
 		combo+=1
 		max_combo=maxi(max_combo,combo)
 		combo_clock=COMBO_GRACE_SECONDS
 		var multiplier:=minf(3.0,1.0+floorf(float(combo-1)/3.0)*0.25)
-		score+=int(48.0*hits*multiplier)
+		var awarded_points:=int(float(raw_points)*multiplier)
+		score+=awarded_points
+		spawn_score_popup(hit_center/float(hits),awarded_points,hits,direct_hits)
+		camera_shake_clock=maxf(camera_shake_clock,0.24 if direct_hits>0 else 0.14)
 		add_anger(float(hits)*ANGER_PER_HIT,"命中")
-		if center_hits>0:
-			gain_evolution("rapid",24.0*center_hits)
+		if direct_hits>0:
+			gain_evolution("rapid",24.0*direct_hits)
 		if hits>=2:
 			gain_evolution("split",34.0+8.0*(hits-2))
 		if combo>=3:
 			gain_evolution("flock",17.0+float(combo))
+		play_impact_sound(direct_hits>0,hits)
+		play_reaction_sound(direct_hits>0,hits)
 	else:
 		combo=0
 	var splat:=make_cylinder(effect_root,radius,0.045,Color(0.93,0.90,0.62,0.88),Vector3(position.x,0.10,position.z),18)
 	splat.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	effects.append({"node":splat,"time":0.52,"max_time":0.52,"kind":"splat"})
-	play_tone(215.0 if hits==0 else 430.0,0.055)
+	if hits==0:play_tone(215.0,0.055)
+
+func spawn_hit_splash(position: Vector3,is_direct: bool) -> void:
+	var splash:=Node3D.new()
+	splash.position=position+Vector3(0,1.0,0)
+	effect_root.add_child(splash)
+	var droplet_count:=8 if is_direct else 5
+	for index in droplet_count:
+		var angle:=TAU*float(index)/float(droplet_count)
+		var droplet:=make_sphere(splash,0.24 if is_direct else 0.18,Color("#fff8dc"),Vector3(cos(angle)*0.75,rng.randf_range(0.2,1.5),sin(angle)*0.75),7,4)
+		droplet.scale=Vector3(0.75,1.35,0.75)
+	effects.append({"node":splash,"time":0.50,"max_time":0.50,"kind":"splash"})
+
+func spawn_score_popup(position: Vector3,points: int,hits: int,direct_hits: int) -> void:
+	var popup:=Label3D.new()
+	popup.font=font
+	popup.font_size=52
+	popup.outline_size=12
+	popup.billboard=BaseMaterial3D.BILLBOARD_ENABLED
+	popup.pixel_size=0.016
+	popup.no_depth_test=true
+	popup.render_priority=120
+	popup.modulate=Color("#ffdc58") if direct_hits>0 else Color.WHITE
+	popup.text="直撃！ +%d"%points if direct_hits>0 else "+%d"%points
+	if hits>1:popup.text+="  ×%d"%hits
+	popup.position=position+Vector3(0,4.6,0)
+	effect_root.add_child(popup)
+	effects.append({"node":popup,"time":1.0,"max_time":1.0,"kind":"popup"})
 
 func add_anger(amount: float,reason: String) -> void:
 	if amount<=0.0:return
@@ -396,28 +459,54 @@ func spawn_target(cluster_index: int=-1) -> void:
 	actor_root.add_child(node)
 	node.position=position
 	var bar:MeshInstance3D=node.get_node("DirtMeter/Fill")
+	var visual:Node3D=node.get_node("Visual")
 	var velocity:=Vector2.from_angle(rng.randf_range(0,TAU))*rng.randf_range(TARGET_MOVE_MIN,TARGET_MOVE_MAX)
-	targets.append({"pos":position,"home":home,"vel":velocity,"dirt":0.0,"max_dirt":max_dirt,"type":type,"radius":radius,"turn":rng.randf_range(0.8,2.4),"node":node,"bar":bar})
+	targets.append({"pos":position,"home":home,"vel":velocity,"dirt":0.0,"max_dirt":max_dirt,"type":type,"radius":radius,"turn":rng.randf_range(0.8,2.4),"node":node,"bar":bar,"visual":visual,"dirt_node":visual.get_node("Dirt"),"reaction_icon":visual.get_node("ReactionIcon"),"left_arm":visual.get_node("LeftArm"),"right_arm":visual.get_node("RightArm"),"left_leg":visual.get_node("LeftLeg"),"right_leg":visual.get_node("RightLeg"),"reaction":0.0,"reaction_kind":"","walk_phase":rng.randf_range(0,TAU)})
 
 func update_targets(delta: float) -> void:
 	for index in range(targets.size()-1,-1,-1):
 		var target:=targets[index]
-		target.turn-=delta
-		if target.turn<=0.0:
-			target.turn=rng.randf_range(1.0,3.0)
-			target.vel=target.vel.rotated(rng.randf_range(-0.85,0.85))
-		var offset:=Vector2(float(target.pos.x-target.home.x),float(target.pos.z-target.home.z))
-		if offset.length()>TARGET_CLUSTER_RADIUS:
-			var homeward:=-offset.normalized()*rng.randf_range(TARGET_MOVE_MIN,TARGET_MOVE_MAX)
-			target.vel=target.vel.lerp(homeward,0.72)
-		target.pos.x=clampf(target.pos.x+target.vel.x*delta,-42.0,42.0)
-		target.pos.z=clampf(target.pos.z+target.vel.y*delta,-98.0,92.0)
+		target.walk_phase+=delta*6.0
+		var reacting:=float(target.reaction)>0.0
+		if reacting:
+			target.reaction=maxf(0.0,float(target.reaction)-delta)
+			var reaction_length:=1.20 if target.reaction_kind=="direct" else 0.82
+			var reaction_progress:=1.0-float(target.reaction)/reaction_length
+			var reaction_wave:=sin(clampf(reaction_progress,0.0,1.0)*PI)
+			target.visual.rotation.x=-reaction_wave*(0.72 if target.reaction_kind=="direct" else 0.42)
+			target.visual.position.y=reaction_wave*(0.48 if target.reaction_kind=="direct" else 0.24)
+			target.left_arm.rotation.z=-reaction_wave*1.35
+			target.right_arm.rotation.z=reaction_wave*1.35
+			target.left_leg.rotation.x=0.0
+			target.right_leg.rotation.x=0.0
+			if target.reaction<=0.0:
+				target.reaction_icon.visible=false
+		else:
+			target.visual.rotation.x=lerpf(target.visual.rotation.x,0.0,minf(1.0,delta*10.0))
+			target.visual.position.y=lerpf(target.visual.position.y,0.0,minf(1.0,delta*10.0))
+			target.left_arm.rotation.z=lerpf(target.left_arm.rotation.z,0.0,minf(1.0,delta*9.0))
+			target.right_arm.rotation.z=lerpf(target.right_arm.rotation.z,0.0,minf(1.0,delta*9.0))
+			var walk:=sin(float(target.walk_phase))*0.42
+			target.left_leg.rotation.x=walk
+			target.right_leg.rotation.x=-walk
+			target.left_arm.rotation.x=-walk*0.72
+			target.right_arm.rotation.x=walk*0.72
+			target.turn-=delta
+			if target.turn<=0.0:
+				target.turn=rng.randf_range(1.0,3.0)
+				target.vel=target.vel.rotated(rng.randf_range(-0.85,0.85))
+			var offset:=Vector2(float(target.pos.x-target.home.x),float(target.pos.z-target.home.z))
+			if offset.length()>TARGET_CLUSTER_RADIUS:
+				var homeward:=-offset.normalized()*rng.randf_range(TARGET_MOVE_MIN,TARGET_MOVE_MAX)
+				target.vel=target.vel.lerp(homeward,0.72)
+			target.pos.x=clampf(target.pos.x+target.vel.x*delta,-42.0,42.0)
+			target.pos.z=clampf(target.pos.z+target.vel.y*delta,-98.0,92.0)
 		target.node.position=target.pos
 		if target.vel.length()>0.1:target.node.rotation.y=atan2(target.vel.x,target.vel.y)
 		var ratio:=clampf(float(target.dirt)/float(target.max_dirt),0.0,1.0)
 		target.bar.scale.x=maxf(0.001,ratio)
 		target.bar.position.x=-0.72+0.72*ratio
-		if float(target.dirt)>=float(target.max_dirt):
+		if float(target.dirt)>=float(target.max_dirt) and float(target.reaction)<=0.0:
 			var bonus:=420 if target.type=="special" else (190 if target.type=="bike" else 120)
 			score+=bonus
 			add_anger(ANGER_PER_DEFEAT,"退場")
@@ -433,7 +522,13 @@ func update_effects(delta: float) -> void:
 		var progress:=1.0-clampf(float(effect.time)/float(effect.max_time),0.0,1.0)
 		if effect.kind=="splat":effect.node.scale=Vector3.ONE*(0.65+progress*0.45)
 		elif effect.kind=="evolution":effect.node.scale=Vector3.ONE*(1.0+progress*8.0)
-		else:
+		elif effect.kind=="popup":
+			effect.node.position.y+=delta*1.7
+			effect.node.modulate.a=clampf(float(effect.time)*2.2,0.0,1.0)
+		elif effect.kind=="splash":
+			effect.node.position.y+=delta*1.1
+			effect.node.scale=Vector3.ONE*(1.0+progress*0.8)
+		elif effect.kind!="audio":
 			effect.node.position.y+=delta*2.4
 			effect.node.scale=Vector3.ONE*(1.0+progress*0.6)
 		if effect.time<=0.0:
@@ -499,7 +594,56 @@ func build_city() -> void:
 		var right_tree:=Vector3(49,0,float(z)-6)
 		if not position_near_any_nest(left_tree,20.0):build_tree(left_tree)
 		if not position_near_any_nest(right_tree,20.0):build_tree(right_tree)
+	build_hero_block()
 	for index in NEST_POSITIONS.size():build_nest(NEST_POSITIONS[index],index)
+
+func build_hero_block() -> void:
+	var pavement:=Color("#d8cbbb")
+	make_box(world_root,Vector3(35,0.20,36),pavement,Vector3(49,0.14,10))
+	for tile_x in range(34,66,4):make_box(world_root,Vector3(0.06,0.025,36),Color("#bbaea0"),Vector3(float(tile_x),0.26,10))
+	for tile_z in range(-8,29,4):make_box(world_root,Vector3(35,0.025,0.06),Color("#bbaea0"),Vector3(49,0.26,float(tile_z)))
+	make_box(world_root,Vector3(13,7.0,23),Color("#bf8a62"),Vector3(64,3.5,10))
+	make_box(world_root,Vector3(0.45,5.3,21),Color("#59443a"),Vector3(57.3,3.0,10))
+	for z in [-0.5,6.0,12.5,19.0]:
+		make_box(world_root,Vector3(0.12,2.7,4.6),Color("#8fd0dc"),Vector3(57.0,3.1,z))
+		make_box(world_root,Vector3(0.18,0.20,5.0),Color("#f3e3c1"),Vector3(56.8,4.85,z))
+	for z in range(0,22,4):
+		var awning_color:=Color("#d75f59") if (z/4)%2==0 else Color("#f3dfc6")
+		var awning:=make_box(world_root,Vector3(3.8,0.20,3.5),awning_color,Vector3(55.5,5.2,float(z)))
+		awning.rotation.z=-0.12
+	make_box(world_root,Vector3(0.45,2.8,6.2),Color("#433833"),Vector3(56.8,7.4,9.0))
+	var shop_sign:=Label3D.new()
+	shop_sign.text="HATO CAFE"
+	shop_sign.font=font
+	shop_sign.font_size=54
+	shop_sign.outline_size=10
+	shop_sign.modulate=Color("#ffe9b7")
+	shop_sign.position=Vector3(56.45,7.5,9.0)
+	shop_sign.rotation.y=-PI/2.0
+	world_root.add_child(shop_sign)
+	build_bench(Vector3(43,0,0))
+	build_bench(Vector3(45,0,22))
+	build_bicycle(Vector3(43,0,15))
+	build_street_lamp(Vector3(38,0,-5))
+	build_street_lamp(Vector3(39,0,27))
+
+func build_bench(position: Vector3) -> void:
+	make_box(world_root,Vector3(5.0,0.35,1.2),Color("#7a4c2c"),position+Vector3(0,1.15,0))
+	make_box(world_root,Vector3(5.0,1.2,0.28),Color("#875635"),position+Vector3(0,1.85,0.48))
+	for x in [-1.8,1.8]:make_box(world_root,Vector3(0.22,1.15,0.80),Color("#34383c"),position+Vector3(x,0.58,0))
+
+func build_bicycle(position: Vector3) -> void:
+	for x in [-1.15,1.15]:
+		var wheel:=make_torus(world_root,0.58,0.08,Color("#293239"),position+Vector3(x,0.72,0),12,6)
+		wheel.rotation.x=PI/2.0
+	make_box(world_root,Vector3(2.2,0.12,0.12),Color("#4b7880"),position+Vector3(0,0.82,0))
+	var frame:=make_box(world_root,Vector3(0.12,1.25,0.12),Color("#4b7880"),position+Vector3(0,1.18,0))
+	frame.rotation.z=0.55
+	make_box(world_root,Vector3(0.85,0.16,0.42),Color("#684536"),position+Vector3(0.20,1.62,0))
+
+func build_street_lamp(position: Vector3) -> void:
+	make_cylinder(world_root,0.16,5.2,Color("#333d43"),position+Vector3(0,2.6,0),8)
+	make_sphere(world_root,0.48,Color("#ffe7a0"),position+Vector3(0,5.2,0),10,6)
 
 func build_shop_row(z: float) -> void:
 	var colors:=[Color("#e7a39a"),Color("#9bc4d7"),Color("#e6c276"),Color("#b5a7ce")]
@@ -541,55 +685,141 @@ func build_nest(position: Vector3,index: int) -> void:
 func build_pigeon(companion: bool) -> Node3D:
 	var root:=Node3D.new()
 	root.name="Companion" if companion else "PigeonAtAltitude"
-	var scale_value:=0.58 if companion else 1.0
-	var body:=make_sphere(root,2.0*scale_value,Color("#9fa5ae"),Vector3.ZERO,10,5)
-	body.scale=Vector3(1.0,1.2,1.35)
-	make_sphere(root,1.25*scale_value,Color("#7f8792"),Vector3(0,1.65*scale_value,-0.55*scale_value),10,5)
-	make_cylinder(root,1.22*scale_value,0.72*scale_value,Color("#659c87"),Vector3(0,0.95*scale_value,-0.40*scale_value),10)
+	var visual:=Node3D.new()
+	visual.name="Visual"
+	root.add_child(visual)
+	var scale_value:=0.60 if companion else 1.0
+	var body:=make_sphere(visual,2.0*scale_value,Color("#9299a5"),Vector3(0,-0.05,0.20)*scale_value,14,8)
+	body.scale=Vector3(1.03,1.10,1.32)
+	var breast:=make_sphere(visual,1.48*scale_value,Color("#c5c8ca"),Vector3(0,-0.42,-1.05)*scale_value,12,7)
+	breast.scale=Vector3(0.88,1.0,0.78)
+	make_sphere(visual,1.32*scale_value,Color("#747c89"),Vector3(0,1.50,-0.78)*scale_value,14,8)
+	var neck_green:=make_sphere(visual,1.20*scale_value,Color("#2a9a79"),Vector3(-0.38,0.78,-0.88)*scale_value,12,7)
+	neck_green.scale=Vector3(0.70,0.62,0.62)
+	var neck_purple:=make_sphere(visual,1.12*scale_value,Color("#8552a0"),Vector3(0.42,0.68,-0.84)*scale_value,12,7)
+	neck_purple.scale=Vector3(0.66,0.56,0.58)
+	for neck in [neck_green,neck_purple]:
+		var neck_material:=neck.material_override.duplicate() as StandardMaterial3D
+		neck_material.roughness=0.24
+		neck_material.metallic=0.28
+		neck.material_override=neck_material
+	for x in [-0.50,0.50]:
+		make_sphere(visual,0.39*scale_value,Color("#fff8e7"),Vector3(x,1.78,-1.82)*scale_value,10,6)
+		make_sphere(visual,0.17*scale_value,Color("#2b201d"),Vector3(x,1.80,-2.15)*scale_value,8,4)
+		make_sphere(visual,0.07*scale_value,Color.WHITE,Vector3(x-0.04,1.87,-2.29)*scale_value,6,3)
+	var beak:=make_cylinder(visual,0.38*scale_value,0.92*scale_value,Color("#e89a70"),Vector3(0,1.48,-2.20)*scale_value,8,0.03)
+	beak.rotation.x=PI/2.0
+	var local_left:=Node3D.new()
+	local_left.name="LeftWing"
+	local_left.position=Vector3(-1.25,0.25,-0.05)*scale_value
+	visual.add_child(local_left)
+	var local_right:=Node3D.new()
+	local_right.name="RightWing"
+	local_right.position=Vector3(1.25,0.25,-0.05)*scale_value
+	visual.add_child(local_right)
+	for feather_index in 4:
+		var length:=(3.0-feather_index*0.30)*scale_value
+		var shade:=Color("#68717f").lightened(feather_index*0.045)
+		var lf:=make_box(local_left,Vector3(length,0.26*scale_value,(0.82+feather_index*0.14)*scale_value),shade,Vector3(-length*0.48,-feather_index*0.05,feather_index*0.32)*scale_value)
+		lf.rotation.y=-0.08*feather_index
+		var rf:=make_box(local_right,Vector3(length,0.26*scale_value,(0.82+feather_index*0.14)*scale_value),shade,Vector3(length*0.48,-feather_index*0.05,feather_index*0.32)*scale_value)
+		rf.rotation.y=0.08*feather_index
+	for tail_index in 5:
+		var tail_x:=(tail_index-2)*0.42*scale_value
+		var tail:=make_box(visual,Vector3(0.62,0.24,2.65)*scale_value,Color("#555e6b").lightened(abs(tail_index-2)*0.035),Vector3(tail_x,-0.45,2.18)*scale_value)
+		tail.rotation.y=(tail_index-2)*0.12
+	for x in [-0.58,0.58]:
+		var leg:=make_cylinder(visual,0.11*scale_value,0.68*scale_value,Color("#da7880"),Vector3(x,-1.75,0.48)*scale_value,7)
+		leg.rotation.x=0.18
+		for toe in [-0.18,0.0,0.18]:
+			var foot:=make_cylinder(visual,0.065*scale_value,0.50*scale_value,Color("#df7f86"),Vector3(x+toe,-2.05,-0.02)*scale_value,6)
+			foot.rotation.x=PI/2.0
 	if not companion:
-		for x in [-0.48,0.48]:
-			make_sphere(root,0.28,Color("#faf6df"),Vector3(x,1.92,-1.57),8,4)
-			make_sphere(root,0.12,Color("#22282d"),Vector3(x,1.94,-1.82),8,4)
-		var beak:=make_cylinder(root,0.38,0.85,Color("#454a50"),Vector3(0,1.55,-1.92),6,0.02)
-		beak.rotation.x=PI/2.0
-		left_wing=Node3D.new()
-		left_wing.position=Vector3(-1.65,0.2,0)
-		root.add_child(left_wing)
-		make_box(left_wing,Vector3(3.4,0.32,1.55),Color("#737b86"),Vector3(-1.35,0,0.15))
-		right_wing=Node3D.new()
-		right_wing.position=Vector3(1.65,0.2,0)
-		root.add_child(right_wing)
-		make_box(right_wing,Vector3(3.4,0.32,1.55),Color("#747d88"),Vector3(1.35,0,0.15))
-		rapid_badge=make_sphere(root,0.34,Color("#70e6ff"),Vector3(0,2.9,0),8,4)
+		left_wing=local_left
+		right_wing=local_right
+		rapid_badge=make_sphere(visual,0.34,Color("#70e6ff"),Vector3(0,2.9,0),8,4)
 		rapid_badge.visible=false
-		split_badge=make_cylinder(root,2.6,0.10,Color(1.0,0.78,0.30,0.65),Vector3(0,-1.0,0),24)
+		split_badge=make_cylinder(visual,2.6,0.10,Color(1.0,0.78,0.30,0.65),Vector3(0,-1.0,0),24)
 		split_badge.visible=false
 		flock_left=build_pigeon(true)
 		flock_left.position=Vector3(-6.0,-0.8,1.5)
 		flock_left.visible=false
-		root.add_child(flock_left)
+		visual.add_child(flock_left)
 		flock_right=build_pigeon(true)
 		flock_right.position=Vector3(6.0,-0.8,1.5)
 		flock_right.visible=false
-		root.add_child(flock_right)
+		visual.add_child(flock_right)
 	return root
 
 func build_ground_character(type: String,serial: int) -> Node3D:
 	var root:=Node3D.new()
 	root.name="%s_%d"%[type,serial]
-	var shirt:=Color.from_hsv(fmod(float(serial)*0.173,1.0),0.45,0.88)
-	if type=="special":shirt=Color("#f2bd36")
-	make_cylinder(root,0.55,1.55,shirt,Vector3(0,1.45,0),8)
-	make_sphere(root,0.48,Color("#e9b994"),Vector3(0,2.65,0),8,4)
-	make_cylinder(root,0.16,1.25,Color("#485968"),Vector3(-0.28,0.45,0),6)
-	make_cylinder(root,0.16,1.25,Color("#485968"),Vector3(0.28,0.45,0),6)
+	var visual:=Node3D.new()
+	visual.name="Visual"
+	root.add_child(visual)
+	var style:=serial%3
+	var skin_colors:=[Color("#eab38f"),Color("#bd7f5d"),Color("#f0c6a1")]
+	var skin:Color=skin_colors[serial%skin_colors.size()]
+	var top_colors:=[Color("#334a70"),Color("#6c9b50"),Color("#b56b6f")]
+	var bottom_colors:=[Color("#283445"),Color("#445166"),Color("#604f52")]
+	var shirt:Color=top_colors[style]
+	if type=="special":shirt=Color("#e5aa2d")
+	for side in [-1,1]:
+		var leg_pivot:=Node3D.new()
+		leg_pivot.name="LeftLeg" if side<0 else "RightLeg"
+		leg_pivot.position=Vector3(float(side)*0.28,1.00,0)
+		visual.add_child(leg_pivot)
+		make_cylinder(leg_pivot,0.18,1.35,bottom_colors[style],Vector3(0,-0.58,0),7)
+		make_box(leg_pivot,Vector3(0.42,0.20,0.68),Color("#24272d"),Vector3(0,-1.27,-0.16))
+	var torso:=make_box(visual,Vector3(1.25,1.60,0.78),shirt,Vector3(0,1.86,0))
+	if style==1:torso.scale=Vector3(1.08,1.0,1.10)
+	make_box(visual,Vector3(0.24,1.20,0.10),Color("#f4eee0"),Vector3(0,1.98,-0.45))
+	if style==0:make_box(visual,Vector3(0.13,0.86,0.12),Color("#b13f46"),Vector3(0,1.89,-0.52))
+	for side in [-1,1]:
+		var arm:=Node3D.new()
+		arm.name="LeftArm" if side<0 else "RightArm"
+		arm.position=Vector3(float(side)*0.78,2.32,0)
+		visual.add_child(arm)
+		make_cylinder(arm,0.17,1.22,shirt.darkened(0.06),Vector3(0,-0.53,0),7)
+		make_sphere(arm,0.22,skin,Vector3(0,-1.15,0),8,4)
+	var head:=make_sphere(visual,0.58,skin,Vector3(0,3.05,0),12,7)
+	head.scale=Vector3(0.92,1.08,0.90)
+	var hair_color:Color=[Color("#24252b"),Color("#5a3828"),Color("#352b2a")][style]
+	var hair:=make_sphere(visual,0.61,hair_color,Vector3(0,3.38,0.05),10,6)
+	hair.scale=Vector3(0.98,0.50,0.95)
+	if style==2:make_box(visual,Vector3(0.95,0.22,0.62),hair_color,Vector3(0,3.39,-0.28))
+	for x in [-0.19,0.19]:
+		make_sphere(visual,0.07,Color("#29231f"),Vector3(x,3.12,-0.52),6,3)
+	make_box(visual,Vector3(0.22,0.055,0.055),Color("#8d4e4c"),Vector3(0,2.88,-0.56))
+	var dirt:=Node3D.new()
+	dirt.name="Dirt"
+	dirt.visible=false
+	visual.add_child(dirt)
+	var face_splat:=make_sphere(dirt,0.30,Color("#f4efcf"),Vector3(0.18,3.17,-0.53),8,4)
+	face_splat.scale=Vector3(1.0,0.65,0.25)
+	var coat_splat:=make_sphere(dirt,0.38,Color("#e9e1b2"),Vector3(-0.24,2.05,-0.43),8,4)
+	coat_splat.scale=Vector3(1.1,0.80,0.22)
+	var reaction_icon:=Label3D.new()
+	reaction_icon.name="ReactionIcon"
+	reaction_icon.text="!"
+	reaction_icon.font=font
+	reaction_icon.font_size=42
+	reaction_icon.outline_size=10
+	reaction_icon.modulate=Color("#ffca4a")
+	reaction_icon.position=Vector3(0,4.25,0)
+	reaction_icon.billboard=BaseMaterial3D.BILLBOARD_ENABLED
+	reaction_icon.pixel_size=0.014
+	reaction_icon.no_depth_test=true
+	reaction_icon.visible=false
+	visual.add_child(reaction_icon)
 	if type=="bike":
-		make_cylinder(root,0.78,0.12,Color("#303b43"),Vector3(-0.72,0.75,0.35),12).rotation.z=PI/2.0
-		make_cylinder(root,0.78,0.12,Color("#303b43"),Vector3(0.72,0.75,0.35),12).rotation.z=PI/2.0
-	if type=="special":make_cylinder(root,0.62,0.24,Color("#ffe273"),Vector3(0,3.08,0),10)
+		make_cylinder(visual,0.78,0.12,Color("#303b43"),Vector3(-0.78,0.72,0.42),12).rotation.z=PI/2.0
+		make_cylinder(visual,0.78,0.12,Color("#303b43"),Vector3(0.78,0.72,0.42),12).rotation.z=PI/2.0
+		make_box(visual,Vector3(1.55,0.10,0.10),Color("#3f5961"),Vector3(0,0.94,0.42))
+	if type=="special":make_cylinder(visual,0.68,0.24,Color("#ffe273"),Vector3(0,3.66,0),10)
 	var meter:=Node3D.new()
 	meter.name="DirtMeter"
-	meter.position=Vector3(0,3.65,0)
+	meter.position=Vector3(0,4.08,0)
 	meter.rotation.x=-0.52
 	root.add_child(meter)
 	make_box(meter,Vector3(1.6,0.16,0.10),Color("#28353b"),Vector3.ZERO)
@@ -617,6 +847,14 @@ func make_cylinder(parent: Node,radius: float,height: float,color: Color,positio
 	mesh.top_radius=radius if top_radius<0.0 else top_radius
 	mesh.height=height
 	mesh.radial_segments=radial
+	return make_mesh(parent,mesh,color,position)
+
+func make_torus(parent: Node,ring_radius: float,pipe_radius: float,color: Color,position: Vector3,rings:=12,ring_segments:=6) -> MeshInstance3D:
+	var mesh:=TorusMesh.new()
+	mesh.inner_radius=maxf(0.02,ring_radius-pipe_radius)
+	mesh.outer_radius=ring_radius+pipe_radius
+	mesh.rings=rings
+	mesh.ring_segments=ring_segments
 	return make_mesh(parent,mesh,color,position)
 
 func make_mesh(parent: Node,mesh: Mesh,color: Color,position: Vector3) -> MeshInstance3D:
@@ -830,6 +1068,32 @@ func debug_combo_burst() -> void:
 		target.node.position=target.pos
 	for i in 3:impact_poop(Vector3(player_pos.x,0.35,player_pos.z))
 
+func debug_single_hit(is_direct: bool) -> void:
+	clear_dynamic_nodes()
+	spawn_target(0)
+	var target:=targets[0]
+	target.pos=Vector3(player_pos.x+(0.0 if is_direct else 3.0),0.0,player_pos.z-2.0)
+	target.home=target.pos
+	target.max_dirt=999.0
+	target.node.position=target.pos
+	impact_poop(Vector3(player_pos.x,0.35,player_pos.z-2.0))
+
+func debug_multi_hit() -> void:
+	clear_dynamic_nodes()
+	for index in 3:
+		spawn_target(index)
+		var target:=targets[index]
+		target.pos=Vector3(player_pos.x+float(index-1)*2.6,0.0,player_pos.z-2.0)
+		target.home=target.pos
+		target.max_dirt=999.0
+		target.node.position=target.pos
+	impact_poop(Vector3(player_pos.x,0.35,player_pos.z-2.0))
+
+func debug_show_hero_block() -> void:
+	player_pos=Vector3(44.0,PLAYER_ALTITUDE,16.0)
+	has_flown_out=true
+	update_player_transform(0.0)
+
 func _input(event: InputEvent) -> void:
 	if OS.is_debug_build() and state==ScreenState.PLAYING and event is InputEventKey and event.pressed and not event.echo:
 		match event.unicode:
@@ -845,6 +1109,10 @@ func _input(event: InputEvent) -> void:
 				anger=100.0
 				finish_sortie(false)
 			54: debug_combo_burst()
+			68,100: debug_single_hit(true)
+			78,110: debug_single_hit(false)
+			77,109: debug_multi_hit()
+			72,104: debug_show_hero_block()
 			55,56,57:
 				var nest_index:=int(event.unicode)-55
 				player_pos=NEST_POSITIONS[nest_index]+Vector3(0.0,PLAYER_ALTITUDE,12.0)
@@ -871,13 +1139,41 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion and drag_active:drag_vector=(event.position-drag_origin)/78.0
 
 func play_tone(frequency: float,duration: float) -> void:
+	audio_player.stream=make_tone_stream(frequency,duration,false)
+	audio_player.play()
+
+func play_drop_whoosh() -> void:
+	play_one_shot(make_tone_stream(310.0,0.10,false),-15.0,0.72)
+
+func play_impact_sound(is_direct: bool,hit_total: int) -> void:
+	var impact_frequency:=92.0 if is_direct else 128.0
+	play_one_shot(make_tone_stream(impact_frequency,0.12,true),-7.0,0.74)
+	play_one_shot(make_tone_stream(660.0+float(hit_total)*32.0,0.08,false),-11.0,1.0)
+
+func play_one_shot(stream: AudioStream,volume_db: float,pitch_scale: float) -> void:
+	var player:=AudioStreamPlayer.new()
+	player.volume_db=volume_db
+	player.pitch_scale=pitch_scale
+	player.stream=stream
+	add_child(player)
+	player.play()
+	effects.append({"node":player,"time":0.32,"max_time":0.32,"kind":"audio"})
+
+func play_reaction_sound(is_direct: bool,hit_total: int) -> void:
+	var pitch:=(0.82 if is_direct else 1.10)+minf(0.15,float(hit_total-1)*0.03)
+	play_one_shot(make_tone_stream(175.0 if is_direct else 245.0,0.22 if is_direct else 0.14,true),-4.0,pitch)
+
+func make_tone_stream(frequency: float,duration: float,vocal: bool) -> AudioStreamWAV:
 	var mix_rate:=22050
 	var frames:=int(duration*mix_rate)
 	var data:=PackedByteArray()
 	data.resize(frames*2)
 	for index in frames:
 		var envelope:=1.0-float(index)/frames
-		var sample:=int(sin(TAU*frequency*index/mix_rate)*envelope*6200.0)
+		var phase:=TAU*frequency*index/mix_rate
+		var wave:=sin(phase)
+		if vocal:wave=sin(phase)+0.35*sin(phase*0.52)+0.18*sin(phase*1.96)
+		var sample:=int(wave*envelope*(4100.0 if vocal else 6200.0))
 		data[index*2]=sample&0xff
 		data[index*2+1]=(sample>>8)&0xff
 	var stream:=AudioStreamWAV.new()
@@ -885,8 +1181,7 @@ func play_tone(frequency: float,duration: float) -> void:
 	stream.mix_rate=mix_rate
 	stream.stereo=false
 	stream.data=data
-	audio_player.stream=stream
-	audio_player.play()
+	return stream
 
 func load_save() -> void:
 	if not FileAccess.file_exists(SAVE_PATH):return
@@ -927,9 +1222,17 @@ func debug_run_checks() -> Array[String]:
 		update_targets(0.1)
 		if player_pos!=before:errors.append("contact damage regression")
 		var anger_before_hit:=anger
+		var score_before_hit:=score
 		impact_poop(Vector3(player_pos.x,0.35,player_pos.z))
 		if anger<=anger_before_hit:errors.append("hit anger feedback")
 		if anger_notice_clock<=0.0:errors.append("anger notice")
+		if score-score_before_hit<DIRECT_HIT_SCORE:errors.append("direct hit score")
+		if String(targets[0].reaction_kind)!="direct":errors.append("direct reaction")
+		if not bool(targets[0].dirt_node.visible):errors.append("persistent dirt")
+		var found_popup:=false
+		for effect in effects:
+			if effect.kind=="popup":found_popup=true
+		if not found_popup:errors.append("score popup")
 	for kind in EVOLUTION_TYPES:
 		trigger_evolution(kind)
 		if not bool(evolved[kind]):errors.append("evolution "+kind)
