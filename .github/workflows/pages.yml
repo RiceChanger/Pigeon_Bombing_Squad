@@ -18,7 +18,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
       - name: Build Web export
         uses: firebelley/godot-export@v8.0.0
         with:
@@ -28,15 +30,14 @@ jobs:
           archive_output: false
           use_preset_export_path: true
           cache: true
-      - name: Prepare Pages artifact
+      - name: Verify Pages artifact
         run: |
-          mkdir -p public
-          cp -r build/web/* public/
-          touch public/.nojekyll
-      - uses: actions/upload-pages-artifact@v3
+          test -f build/web/index.html
+          find build/web -maxdepth 1 -type f -printf '%f\n' | sort
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
         with:
-          path: public
-          include-hidden-files: true
+          path: build/web
   deploy:
     environment:
       name: github-pages
