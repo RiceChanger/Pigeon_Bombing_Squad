@@ -22,22 +22,25 @@ jobs:
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
       - name: Build Web export
+        id: export
         uses: firebelley/godot-export@v8.0.0
         with:
           godot_executable_download_url: https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip
           godot_export_templates_download_url: https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_export_templates.tpz
           relative_project_path: ./
           archive_output: false
-          use_preset_export_path: true
+          presets_to_export: Web
           cache: true
       - name: Verify Pages artifact
+        env:
+          WEB_EXPORT_DIR: ${{ steps.export.outputs.build_directory }}/Web
         run: |
-          test -f build/web/index.html
-          find build/web -maxdepth 1 -type f -printf '%f\n' | sort
+          test -f "$WEB_EXPORT_DIR/index.html"
+          find "$WEB_EXPORT_DIR" -maxdepth 1 -type f -printf '%f\n' | sort
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: build/web
+          path: ${{ steps.export.outputs.build_directory }}/Web
   deploy:
     environment:
       name: github-pages
