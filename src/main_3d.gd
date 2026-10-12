@@ -24,6 +24,10 @@ const NEST_TRIGGER_RADIUS := 7.0
 const NORMAL_HIT_SCORE := 50
 const DIRECT_HIT_SCORE := 110
 const DIRECT_HIT_RADIUS := 1.45
+const SPLASH_POOL_SIZE := 18
+const SPLAT_POOL_SIZE := 10
+const POPUP_POOL_SIZE := 8
+const AUDIO_POOL_SIZE := 16
 const SAVE_PATH := "user://pigeon_bombing_3d_save.json"
 const EVOLUTION_TYPES := ["rapid", "split", "flock"]
 
@@ -56,7 +60,7 @@ var showcase_clock := 0.0
 var evolution_slow_clock := 0.0
 var evolution_banner_clock := 0.0
 var last_result := {}
-var save_data := {"best":0, "breadcrumbs":0, "lineage":""}
+var save_data := {"best":0, "total_score":0, "breadcrumbs":0, "lineage":""}
 var targets: Array[Dictionary] = []
 var poops: Array[Dictionary] = []
 var effects: Array[Dictionary] = []
@@ -88,6 +92,17 @@ var banner_label: Label
 var audio_player: AudioStreamPlayer
 var font: Font
 var material_cache := {}
+var audio_stream_cache := {}
+var splash_pool: Array[Node3D] = []
+var splat_pool: Array[MeshInstance3D] = []
+var popup_pool: Array[Label3D] = []
+var audio_pool: Array[AudioStreamPlayer] = []
+var splash_pool_cursor := 0
+var splat_pool_cursor := 0
+var popup_pool_cursor := 0
+var audio_pool_cursor := 0
+var last_impact_usec := 0
+var max_impact_usec := 0
 var flight_time := 0.0
 
 func _ready() -> void:
@@ -144,7 +159,61 @@ func setup_scene() -> void:
 	canvas.add_child(ui_root)
 	audio_player = AudioStreamPlayer.new()
 	add_child(audio_player)
+	setup_effect_pools()
 	update_player_transform(0.0)
+
+func setup_effect_pools() -> void:
+	for pool_index in SPLASH_POOL_SIZE:
+		var splash:=Node3D.new()
+		splash.name="PooledSplash%d"%pool_index
+		splash.visible=false
+		effect_root.add_child(splash)
+		for droplet_index in 8:
+			var droplet:=make_sphere(splash,0.24,Color("#fff8dc"),Vector3.ZERO,7,4)
+			droplet.name="Droplet%d"%droplet_index
+		splash_pool.append(splash)
+	for pool_index in SPLAT_POOL_SIZE:
+		var splat:=make_cylinder(effect_root,1.0,0.045,Color(0.93,0.90,0.62,0.88),Vector3.ZERO,18)
+		splat.name="PooledSplat%d"%pool_index
+		splat.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		splat.visible=false
+		splat_pool.append(splat)
+	for pool_index in POPUP_POOL_SIZE:
+		var popup:=Label3D.new()
+		popup.name="PooledScorePopup%d"%pool_index
+		popup.font=font
+		popup.font_size=52
+		popup.outline_size=12
+		popup.billboard=BaseMaterial3D.BILLBOARD_ENABLED
+		popup.pixel_size=0.016
+		popup.no_depth_test=true
+		popup.render_priority=120
+		popup.visible=false
+		effect_root.add_child(popup)
+		popup_pool.append(popup)
+	for pool_index in AUDIO_POOL_SIZE:
+		var player:=AudioStreamPlayer.new()
+		player.name="PooledAudio%d"%pool_index
+		add_child(player)
+		audio_pool.append(player)
+	prewarm_audio_streams()
+
+func prewarm_audio_streams() -> void:
+	audio_stream_cache.drop=make_tone_stream(310.0,0.10,false)
+	audio_stream_cache.impact_direct=make_tone_stream(92.0,0.12,true)
+	audio_stream_cache.impact_normal=make_tone_stream(128.0,0.12,true)
+	audio_stream_cache.score=make_tone_stream(692.0,0.08,false)
+	audio_stream_cache.reaction_direct=make_tone_stream(175.0,0.22,true)
+	audio_stream_cache.reaction_normal=make_tone_stream(245.0,0.14,true)
+
+func remove_active_effect_for(node: Node) -> void:
+	for index in range(effects.size()-1,-1,-1):
+		if effects[index].node==node:
+			effects.remove_at(index)
+
+func release_pooled_effect(effect: Dictionary) -> void:
+	if effect.kind=="audio":effect.node.stop()
+	else:effect.node.visible=false
 
 func _process(delta: float) -> void:
 	flight_time += delta
@@ -291,6 +360,7 @@ func update_poops(delta: float) -> void:
 			poops.remove_at(index)
 
 func impact_poop(position: Vector3) -> void:
+	var impact_started:=Time.get_ticks_usec()
 	var radius:=current_radius()
 	var hits:=0
 	var direct_hits:=0
@@ -335,37 +405,48 @@ func impact_poop(position: Vector3) -> void:
 		play_reaction_sound(direct_hits>0,hits)
 	else:
 		combo=0
-	var splat:=make_cylinder(effect_root,radius,0.045,Color(0.93,0.90,0.62,0.88),Vector3(position.x,0.10,position.z),18)
-	splat.cast_shadow=GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	effects.append({"node":splat,"time":0.52,"max_time":0.52,"kind":"splat"})
+	spawn_ground_splat(position,radius)
 	if hits==0:play_tone(215.0,0.055)
+	last_impact_usec=Time.get_ticks_usec()-impact_started
+	max_impact_usec=maxi(max_impact_usec,last_impact_usec)
 
 func spawn_hit_splash(position: Vector3,is_direct: bool) -> void:
-	var splash:=Node3D.new()
+	var splash:=splash_pool[splash_pool_cursor]
+	splash_pool_cursor=(splash_pool_cursor+1)%splash_pool.size()
+	remove_active_effect_for(splash)
 	splash.position=position+Vector3(0,1.0,0)
-	effect_root.add_child(splash)
+	splash.scale=Vector3.ONE
+	splash.visible=true
 	var droplet_count:=8 if is_direct else 5
-	for index in droplet_count:
-		var angle:=TAU*float(index)/float(droplet_count)
-		var droplet:=make_sphere(splash,0.24 if is_direct else 0.18,Color("#fff8dc"),Vector3(cos(angle)*0.75,rng.randf_range(0.2,1.5),sin(angle)*0.75),7,4)
-		droplet.scale=Vector3(0.75,1.35,0.75)
-	effects.append({"node":splash,"time":0.50,"max_time":0.50,"kind":"splash"})
+	for index in splash.get_child_count():
+		var droplet:=splash.get_child(index) as MeshInstance3D
+		droplet.visible=index<droplet_count
+		if index<droplet_count:
+			var angle:=TAU*float(index)/float(droplet_count)
+			droplet.position=Vector3(cos(angle)*0.75,rng.randf_range(0.2,1.5),sin(angle)*0.75)
+			var size:=1.0 if is_direct else 0.75
+			droplet.scale=Vector3(0.75,1.35,0.75)*size
+	effects.append({"node":splash,"time":0.50,"max_time":0.50,"kind":"splash","pooled":true})
+
+func spawn_ground_splat(position: Vector3,radius: float) -> void:
+	var splat:=splat_pool[splat_pool_cursor]
+	splat_pool_cursor=(splat_pool_cursor+1)%splat_pool.size()
+	remove_active_effect_for(splat)
+	splat.position=Vector3(position.x,0.10,position.z)
+	splat.scale=Vector3(radius,1.0,radius)*0.65
+	splat.visible=true
+	effects.append({"node":splat,"time":0.52,"max_time":0.52,"kind":"splat","pooled":true,"base_radius":radius})
 
 func spawn_score_popup(position: Vector3,points: int,hits: int,direct_hits: int) -> void:
-	var popup:=Label3D.new()
-	popup.font=font
-	popup.font_size=52
-	popup.outline_size=12
-	popup.billboard=BaseMaterial3D.BILLBOARD_ENABLED
-	popup.pixel_size=0.016
-	popup.no_depth_test=true
-	popup.render_priority=120
+	var popup:=popup_pool[popup_pool_cursor]
+	popup_pool_cursor=(popup_pool_cursor+1)%popup_pool.size()
+	remove_active_effect_for(popup)
 	popup.modulate=Color("#ffdc58") if direct_hits>0 else Color.WHITE
 	popup.text="直撃！ +%d"%points if direct_hits>0 else "+%d"%points
 	if hits>1:popup.text+="  ×%d"%hits
 	popup.position=position+Vector3(0,4.6,0)
-	effect_root.add_child(popup)
-	effects.append({"node":popup,"time":1.0,"max_time":1.0,"kind":"popup"})
+	popup.visible=true
+	effects.append({"node":popup,"time":1.0,"max_time":1.0,"kind":"popup","pooled":true})
 
 func add_anger(amount: float,reason: String) -> void:
 	if amount<=0.0:return
@@ -520,7 +601,9 @@ func update_effects(delta: float) -> void:
 		var effect:=effects[index]
 		effect.time-=delta
 		var progress:=1.0-clampf(float(effect.time)/float(effect.max_time),0.0,1.0)
-		if effect.kind=="splat":effect.node.scale=Vector3.ONE*(0.65+progress*0.45)
+		if effect.kind=="splat":
+			var splat_scale:=float(effect.base_radius)*(0.65+progress*0.45)
+			effect.node.scale=Vector3(splat_scale,1.0,splat_scale)
 		elif effect.kind=="evolution":effect.node.scale=Vector3.ONE*(1.0+progress*8.0)
 		elif effect.kind=="popup":
 			effect.node.position.y+=delta*1.7
@@ -532,7 +615,8 @@ func update_effects(delta: float) -> void:
 			effect.node.position.y+=delta*2.4
 			effect.node.scale=Vector3.ONE*(1.0+progress*0.6)
 		if effect.time<=0.0:
-			effect.node.queue_free()
+			if bool(effect.get("pooled",false)):release_pooled_effect(effect)
+			else:effect.node.queue_free()
 			effects.remove_at(index)
 
 func strongest_lineage() -> String:
@@ -557,9 +641,10 @@ func finish_sortie(success: bool) -> void:
 		inherited=strongest_lineage()
 		save_data.lineage=inherited
 		save_data.breadcrumbs=int(save_data.breadcrumbs)+confirmed_reward
+		save_data.total_score=int(save_data.total_score)+score
 		save_data.best=maxi(int(save_data.best),score)
 		save_game()
-	last_result={"success":success,"score":score,"hits":hit_count,"combo":max_combo,"reward":confirmed_reward,"lost":pending_reward-confirmed_reward,"lineage":inherited}
+	last_result={"success":success,"score":score,"total_score":int(save_data.total_score),"best":int(save_data.best),"hits":hit_count,"combo":max_combo,"reward":confirmed_reward,"lost":pending_reward-confirmed_reward,"lineage":inherited}
 	build_result_ui()
 	play_tone(720.0 if success else 105.0,0.24)
 
@@ -570,7 +655,9 @@ func clear_dynamic_nodes() -> void:
 		for key in ["node","marker","shadow"]:
 			if is_instance_valid(poop[key]):poop[key].queue_free()
 	for effect in effects:
-		if is_instance_valid(effect.node):effect.node.queue_free()
+		if is_instance_valid(effect.node):
+			if bool(effect.get("pooled",false)):release_pooled_effect(effect)
+			else:effect.node.queue_free()
 	targets.clear()
 	poops.clear()
 	effects.clear()
@@ -950,7 +1037,8 @@ func show_title() -> void:
 	make_panel(Rect2(24,28,492,205),Color(0.06,0.12,0.15,0.82),22)
 	make_label("ハト爆撃隊",Rect2(42,48,456,64),46,Color("#fff0af"),true)
 	make_label("狙う → 進化する → 欲張るか帰るか",Rect2(42,116,456,40),18,Color.WHITE,true)
-	make_label("血統：%s　BEST %05d"%[lineage_display(String(save_data.lineage)),int(save_data.best)],Rect2(42,164,456,36),17,Color("#c6e8ef"),true)
+	make_label("累計 %07d　BEST %05d"%[int(save_data.total_score),int(save_data.best)],Rect2(42,158,456,30),17,Color("#c6e8ef"),true)
+	make_label("血統：%s"%lineage_display(String(save_data.lineage)),Rect2(42,188,456,28),15,Color("#d8b6ff"),true)
 	make_panel(Rect2(40,690,460,210),Color(0.05,0.10,0.12,0.68),22)
 	make_button("出撃する！",Rect2(95,724,350,76),start_sortie,Color("#ffd35e"))
 	make_label("ドラッグ移動のみ・攻撃は自動",Rect2(75,820,390,34),17,Color.WHITE,true)
@@ -991,7 +1079,7 @@ func start_sortie() -> void:
 func build_hud() -> void:
 	clear_ui()
 	make_panel(Rect2(12,12,516,184),Color(0.04,0.09,0.11,0.82),16)
-	score_label=make_label("SCORE 00000",Rect2(25,20,260,34),20)
+	score_label=make_label("今回 00000｜累計 0000000",Rect2(25,20,325,34),17)
 	combo_label=make_label("COMBO 0",Rect2(350,20,150,34),17,Color("#ffd35e"),true)
 	var colors:={"rapid":Color("#70e6ff"),"split":Color("#ffcf62"),"flock":Color("#d19cff")}
 	var names:={"rapid":"中心命中・連射","split":"複数命中・分裂","flock":"コンボ・群れ"}
@@ -1020,7 +1108,7 @@ func build_hud() -> void:
 
 func update_hud() -> void:
 	if not is_instance_valid(score_label):return
-	score_label.text="SCORE %05d"%score
+	score_label.text="今回 %05d｜累計 %07d"%[score,int(save_data.total_score)]
 	combo_label.text="COMBO %d"%combo
 	anger_bar.size.x=324.0*anger/100.0
 	anger_bar.color=Color.WHITE if anger_flash_clock>0.0 and int(anger_flash_clock*24.0)%2==0 else Color("#ff6a5f")
@@ -1040,16 +1128,20 @@ func build_result_ui() -> void:
 	var success:=bool(last_result.success)
 	make_panel(Rect2(28,70,484,820),Color(0.04,0.08,0.10,0.90),24)
 	make_label("帰巣成功！" if success else "怒り爆発…",Rect2(50,100,440,70),40,Color("#a8ffd5") if success else Color("#ff8d83"),true)
-	make_label("SCORE %05d"%int(last_result.score),Rect2(50,200,440,56),34,Color.WHITE,true)
-	make_label("命中 %d　最大COMBO %d"%[int(last_result.hits),int(last_result.combo)],Rect2(50,270,440,40),20,Color("#c9e7ed"),true)
+	make_label("今回 %05d"%int(last_result.score),Rect2(50,190,440,50),32,Color.WHITE,true)
+	make_label("累計 %07d"%int(last_result.total_score),Rect2(50,245,440,42),24,Color("#a8ffd5"),true)
+	make_label("自己ベスト %05d"%int(last_result.best),Rect2(50,290,440,38),20,Color("#ffd35e"),true)
+	make_label("命中 %d　最大COMBO %d"%[int(last_result.hits),int(last_result.combo)],Rect2(50,335,440,40),19,Color("#c9e7ed"),true)
 	if success:
-		make_label("パンくず +%d　確定"%int(last_result.reward),Rect2(50,340,440,44),24,Color("#f4df9c"),true)
-		make_label("継承：%s"%lineage_display(String(last_result.lineage)),Rect2(50,405,440,50),26,Color("#d8b6ff"),true)
+		make_label("今回のスコアを累計へ加算" ,Rect2(50,390,440,34),18,Color("#a8ffd5"),true)
+		make_label("パンくず +%d　確定"%int(last_result.reward),Rect2(50,425,440,42),22,Color("#f4df9c"),true)
+		make_label("継承：%s"%lineage_display(String(last_result.lineage)),Rect2(50,470,440,44),22,Color("#d8b6ff"),true)
 	else:
-		make_label("未確定パン %d を喪失"%int(last_result.lost),Rect2(50,340,440,44),24,Color("#ffaaa0"),true)
-		make_label("前回の血統は保持",Rect2(50,405,440,50),22,Color("#d8b6ff"),true)
-	make_panel(Rect2(75,500,390,86),Color(0.13,0.18,0.20,0.72),16)
-	make_label("欲張るほど高得点、帰れば確定",Rect2(90,518,360,48),17,Color("#c9d8dc"),true)
+		make_label("今回のスコアは累計へ加算されません",Rect2(50,390,440,34),17,Color("#ffaaa0"),true)
+		make_label("未確定パン %d を喪失"%int(last_result.lost),Rect2(50,425,440,42),22,Color("#ffaaa0"),true)
+		make_label("前回の血統は保持",Rect2(50,470,440,44),20,Color("#d8b6ff"),true)
+	make_panel(Rect2(75,525,390,76),Color(0.13,0.18,0.20,0.72),16)
+	make_label("欲張るほど高得点、帰れば累計へ確定",Rect2(90,540,360,44),16,Color("#c9d8dc"),true)
 	make_button("もう一度出撃",Rect2(80,650,380,68),start_sortie,Color("#ffd35e"))
 	make_button("タイトルへ",Rect2(150,750,240,58),show_title,Color("#d9f0e2"))
 
@@ -1139,29 +1231,32 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventMouseMotion and drag_active:drag_vector=(event.position-drag_origin)/78.0
 
 func play_tone(frequency: float,duration: float) -> void:
-	audio_player.stream=make_tone_stream(frequency,duration,false)
+	var key:="tone_%.2f_%.3f"%[frequency,duration]
+	if not audio_stream_cache.has(key):audio_stream_cache[key]=make_tone_stream(frequency,duration,false)
+	audio_player.stream=audio_stream_cache[key]
 	audio_player.play()
 
 func play_drop_whoosh() -> void:
-	play_one_shot(make_tone_stream(310.0,0.10,false),-15.0,0.72)
+	play_one_shot(audio_stream_cache.drop,-15.0,0.72)
 
 func play_impact_sound(is_direct: bool,hit_total: int) -> void:
-	var impact_frequency:=92.0 if is_direct else 128.0
-	play_one_shot(make_tone_stream(impact_frequency,0.12,true),-7.0,0.74)
-	play_one_shot(make_tone_stream(660.0+float(hit_total)*32.0,0.08,false),-11.0,1.0)
+	play_one_shot(audio_stream_cache.impact_direct if is_direct else audio_stream_cache.impact_normal,-7.0,0.74)
+	play_one_shot(audio_stream_cache.score,-11.0,(660.0+float(hit_total)*32.0)/692.0)
 
 func play_one_shot(stream: AudioStream,volume_db: float,pitch_scale: float) -> void:
-	var player:=AudioStreamPlayer.new()
+	var player:=audio_pool[audio_pool_cursor]
+	audio_pool_cursor=(audio_pool_cursor+1)%audio_pool.size()
+	remove_active_effect_for(player)
+	player.stop()
 	player.volume_db=volume_db
 	player.pitch_scale=pitch_scale
 	player.stream=stream
-	add_child(player)
 	player.play()
-	effects.append({"node":player,"time":0.32,"max_time":0.32,"kind":"audio"})
+	effects.append({"node":player,"time":0.32,"max_time":0.32,"kind":"audio","pooled":true})
 
 func play_reaction_sound(is_direct: bool,hit_total: int) -> void:
 	var pitch:=(0.82 if is_direct else 1.10)+minf(0.15,float(hit_total-1)*0.03)
-	play_one_shot(make_tone_stream(175.0 if is_direct else 245.0,0.22 if is_direct else 0.14,true),-4.0,pitch)
+	play_one_shot(audio_stream_cache.reaction_direct if is_direct else audio_stream_cache.reaction_normal,-4.0,pitch)
 
 func make_tone_stream(frequency: float,duration: float,vocal: bool) -> AudioStreamWAV:
 	var mix_rate:=22050
@@ -1190,6 +1285,7 @@ func load_save() -> void:
 	var parsed=JSON.parse_string(file.get_as_text())
 	if typeof(parsed)!=TYPE_DICTIONARY:return
 	if parsed.has("best"):save_data.best=int(parsed.best)
+	if parsed.has("total_score"):save_data.total_score=int(parsed.total_score)
 	if parsed.has("breadcrumbs"):save_data.breadcrumbs=int(parsed.breadcrumbs)
 	if parsed.has("lineage"):save_data.lineage=String(parsed.lineage)
 
@@ -1203,6 +1299,8 @@ func debug_run_checks() -> Array[String]:
 	if PLAYER_ALTITUDE<=6.0:errors.append("player altitude")
 	if EVOLUTION_TYPES.size()!=3:errors.append("evolution count")
 	if NEST_POSITIONS.size()!=3:errors.append("nest count")
+	if splash_pool.size()!=SPLASH_POOL_SIZE or splat_pool.size()!=SPLAT_POOL_SIZE:errors.append("impact pool setup")
+	if popup_pool.size()!=POPUP_POOL_SIZE or audio_pool.size()!=AUDIO_POOL_SIZE:errors.append("feedback pool setup")
 	start_sortie()
 	if targets.size()!=TARGET_CLUSTER_CENTERS.size()*INITIAL_TARGETS_PER_CLUSTER:errors.append("clustered target count")
 	clear_dynamic_nodes()
@@ -1233,9 +1331,18 @@ func debug_run_checks() -> Array[String]:
 		for effect in effects:
 			if effect.kind=="popup":found_popup=true
 		if not found_popup:errors.append("score popup")
+	debug_multi_hit()
+	var first_multi_impact_usec:=last_impact_usec
+	max_impact_usec=0
+	for repeat_index in 30:impact_poop(Vector3(player_pos.x,0.35,player_pos.z-2.0))
+	print("PERF impact first_multi_us=%d repeated_30_max_us=%d"%[first_multi_impact_usec,max_impact_usec])
+	if first_multi_impact_usec<=0 or first_multi_impact_usec>16000:errors.append("multi hit frame budget")
+	if max_impact_usec>16000:errors.append("repeated hit frame budget")
 	for kind in EVOLUTION_TYPES:
 		trigger_evolution(kind)
 		if not bool(evolved[kind]):errors.append("evolution "+kind)
+	var total_before:=int(save_data.total_score)
+	score=321
 	evolution.rapid=100.0
 	for nest_index in NEST_POSITIONS.size():
 		if nest_index>0:start_sortie()
@@ -1245,12 +1352,16 @@ func debug_run_checks() -> Array[String]:
 		spawn_clock=99.0
 		update_game(0.01)
 		if state!=ScreenState.RESULT or not bool(last_result.success):errors.append("nest %d banking"%nest_index)
+	if int(save_data.total_score)!=total_before+321:errors.append("cumulative score banking")
 	if String(save_data.lineage)=="":errors.append("lineage save")
+	var total_after_success:=int(save_data.total_score)
 	start_sortie()
+	score=222
 	anger=100.0
 	update_game(0.01)
 	if state!=ScreenState.RESULT:errors.append("anger result")
 	if String(save_data.lineage)=="":errors.append("lineage lost on failure")
+	if int(save_data.total_score)!=total_after_success:errors.append("failure cumulative score")
 	save_data=previous_save
 	save_game()
 	return errors
